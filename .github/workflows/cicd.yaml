@@ -1,0 +1,98 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-test:
+    name: Build, Test, and Verify Container
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: ./app
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run basic application import test
+        working-directory: ./app
+        run: |
+          python -c "import app; print('App import successful')"
+
+      - name: Build Docker image
+        run: |
+          docker build -f docker/Dockerfile -t kubernetes-cicd-pipeline:latest .
+
+      - name: Run container for integration test
+        run: |
+          docker run -d --rm -p 5000:5000 --name kubernetes-cicd-pipeline kubernetes-cicd-pipeline:latest
+          # Wait for container to become ready
+          for i in {1..10}; do
+            if curl -fsS http://localhost:5000/health > /dev/null; then
+              echo "Application is healthy."
+              break
+            fi
+            echo "Waiting for application to become healthy..."
+            sleep 3
+          done
+          curl -fsS http://localhost:5000/ || (echo "Root endpoint did not respond correctly" && exit 1)
+
+      - name: Stop container
+        if: always()
+        run: |
+          docker stop kubernetes-cicd-pipeline || true
+
+  push-image-and-prepare-deploy:
+    name: Push Image and Prepare for Deployment
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}/kubernetes-cicd-pipeline
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and tag image
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          docker build -f docker/Dockerfile -t $REGISTRY/${IMAGE_NAME}:${IMAGE_TAG} .
+          docker tag $REGISTRY/${IMAGE_NAME}:${IMAGE_TAG} $REGISTRY/${IMAGE_NAME}:latest
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Push image
+        run: |
+          docker push $REGISTRY/${IMAGE_NAME}:${IMAGE_TAG}
+          docker push $REGISTRY/${IMAGE_NAME}:latest
+
+      - name: Prepare Kubernetes manifests (dry-run style)
+        run: |
+          echo "Preparing Kubernetes manifests with image tag $IMAGE_TAG"
+          echo "You would typically run something like:"
+          echo "kubectl set image deployment/kubernetes-cicd-pipeline kubernetes-cicd-pipeline=$REGISTRY/${IMAGE_NAME}:${IMAGE_TAG} --namespace=<your-namespace>"
+
